@@ -1,205 +1,251 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use deno_core::anyhow::bail;
+use async_trait::async_trait;
+use deno_core::anyhow::anyhow;
 use deno_core::anyhow::Context;
 use deno_core::error::custom_error;
 use deno_core::error::AnyError;
+use deno_core::futures::future::BoxFuture;
+use deno_core::futures::future::Shared;
+use deno_core::futures::FutureExt;
 use deno_core::parking_lot::Mutex;
-use deno_core::serde::Deserialize;
 use deno_core::serde_json;
 use deno_core::url::Url;
-use deno_runtime::colors;
-use deno_runtime::deno_fetch::reqwest;
-use serde::Serialize;
+use deno_core::TaskQueue;
+use deno_npm::registry::NpmPackageInfo;
+use deno_npm::registry::NpmRegistryApi;
+use deno_npm::registry::NpmRegistryPackageInfoLoadError;
+use once_cell::sync::Lazy;
 
-use crate::file_fetcher::CacheSetting;
-use crate::fs_util;
-use crate::http_cache::CACHE_PERM;
+use crate::args::CacheSetting;
+use crate::cache::CACHE_PERM;
+use crate::http_util::HttpClient;
+use crate::util::fs::atomic_write_file;
+use crate::util::progress_bar::ProgressBar;
+use crate::util::sync::AtomicFlag;
 
+use super::cache::should_sync_download;
 use super::cache::NpmCache;
-use super::version_req::NpmVersionReq;
 
-// npm registry docs: https://github.com/npm/registry/blob/master/docs/REGISTRY-API.md
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct NpmPackageInfo {
-  pub name: String,
-  pub versions: HashMap<String, NpmPackageVersionInfo>,
-}
-
-pub struct NpmDependencyEntry {
-  pub bare_specifier: String,
-  pub name: String,
-  pub version_req: NpmVersionReq,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct NpmPackageVersionInfo {
-  pub version: String,
-  pub dist: NpmPackageVersionDistInfo,
-  // Bare specifier to version (ex. `"typescript": "^3.0.1") or possibly
-  // package and version (ex. `"typescript-3.0.1": "npm:typescript@3.0.1"`).
-  #[serde(default)]
-  pub dependencies: HashMap<String, String>,
-}
-
-impl NpmPackageVersionInfo {
-  pub fn dependencies_as_entries(
-    &self,
-  ) -> Result<Vec<NpmDependencyEntry>, AnyError> {
-    fn entry_as_bare_specifier_and_reference(
-      entry: (&String, &String),
-    ) -> Result<NpmDependencyEntry, AnyError> {
-      let bare_specifier = entry.0.clone();
-      let (name, version_req) =
-        if let Some(package_and_version) = entry.1.strip_prefix("npm:") {
-          if let Some((name, version)) = package_and_version.rsplit_once('@') {
-            (name.to_string(), version.to_string())
-          } else {
-            bail!("could not find @ symbol in npm url '{}'", entry.1);
-          }
-        } else {
-          (entry.0.clone(), entry.1.clone())
-        };
-      let version_req =
-        NpmVersionReq::parse(&version_req).with_context(|| {
-          format!(
-            "error parsing version requirement for dependency: {}@{}",
-            bare_specifier, version_req
-          )
-        })?;
-      Ok(NpmDependencyEntry {
-        bare_specifier,
-        name,
-        version_req,
-      })
-    }
-
-    self
-      .dependencies
-      .iter()
-      .map(entry_as_bare_specifier_and_reference)
-      .collect::<Result<Vec<_>, AnyError>>()
-  }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct NpmPackageVersionDistInfo {
-  /// URL to the tarball.
-  pub tarball: String,
-  pub shasum: String,
-  pub integrity: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct NpmRegistryApi {
-  base_url: Url,
-  cache: NpmCache,
-  mem_cache: Arc<Mutex<HashMap<String, Option<NpmPackageInfo>>>>,
-  reload: bool,
-  cache_setting: CacheSetting,
-}
-
-impl NpmRegistryApi {
-  pub fn default_url() -> Url {
-    let env_var_name = "DENO_NPM_REGISTRY";
-    if let Ok(registry_url) = std::env::var(env_var_name) {
-      // ensure there is a trailing slash for the directory
-      let registry_url = format!("{}/", registry_url.trim_end_matches('/'));
-      match Url::parse(&registry_url) {
-        Ok(url) => url,
-        Err(err) => {
-          eprintln!("{}: Invalid {} environment variable. Please provide a valid url.\n\n{:#}",
-          colors::red_bold("error"),
-          env_var_name, err);
-          std::process::exit(1);
-        }
+static NPM_REGISTRY_DEFAULT_URL: Lazy<Url> = Lazy::new(|| {
+  let env_var_name = "NPM_CONFIG_REGISTRY";
+  if let Ok(registry_url) = std::env::var(env_var_name) {
+    // ensure there is a trailing slash for the directory
+    let registry_url = format!("{}/", registry_url.trim_end_matches('/'));
+    match Url::parse(&registry_url) {
+      Ok(url) => {
+        return url;
       }
-    } else {
-      Url::parse("https://registry.npmjs.org").unwrap()
+      Err(err) => {
+        log::debug!("Invalid {} environment variable: {:#}", env_var_name, err,);
+      }
     }
+  }
+
+  Url::parse("https://registry.npmjs.org").unwrap()
+});
+
+#[derive(Debug)]
+pub struct CliNpmRegistryApi(Option<Arc<CliNpmRegistryApiInner>>);
+
+impl CliNpmRegistryApi {
+  pub fn default_url() -> &'static Url {
+    &NPM_REGISTRY_DEFAULT_URL
   }
 
   pub fn new(
-    cache: NpmCache,
-    reload: bool,
-    cache_setting: CacheSetting,
-  ) -> Self {
-    Self::from_base(Self::default_url(), cache, reload, cache_setting)
-  }
-
-  pub fn from_base(
     base_url: Url,
-    cache: NpmCache,
-    reload: bool,
-    cache_setting: CacheSetting,
+    cache: Arc<NpmCache>,
+    http_client: Arc<HttpClient>,
+    progress_bar: ProgressBar,
   ) -> Self {
-    Self {
+    Self(Some(Arc::new(CliNpmRegistryApiInner {
       base_url,
       cache,
+      force_reload_flag: Default::default(),
       mem_cache: Default::default(),
-      reload,
-      cache_setting,
-    }
+      previously_reloaded_packages: Default::default(),
+      http_client,
+      progress_bar,
+    })))
+  }
+
+  /// Creates an npm registry API that will be uninitialized. This is
+  /// useful for tests or for initializing the LSP.
+  pub fn new_uninitialized() -> Self {
+    Self(None)
+  }
+
+  /// Clears the internal memory cache.
+  pub fn clear_memory_cache(&self) {
+    self.inner().clear_memory_cache();
+  }
+
+  pub fn get_cached_package_info(
+    &self,
+    name: &str,
+  ) -> Option<Arc<NpmPackageInfo>> {
+    self.inner().get_cached_package_info(name)
   }
 
   pub fn base_url(&self) -> &Url {
-    &self.base_url
+    &self.inner().base_url
   }
 
-  pub async fn package_info(
-    &self,
-    name: &str,
-  ) -> Result<NpmPackageInfo, AnyError> {
-    let maybe_package_info = self.maybe_package_info(name).await?;
-    match maybe_package_info {
-      Some(package_info) => Ok(package_info),
-      None => bail!("npm package '{}' does not exist", name),
+  /// Marks that new requests for package information should retrieve it
+  /// from the npm registry
+  ///
+  /// Returns true if it was successfully set for the first time.
+  pub fn mark_force_reload(&self) -> bool {
+    // never force reload the registry information if reloading
+    // is disabled or if we're already reloading
+    if matches!(
+      self.inner().cache.cache_setting(),
+      CacheSetting::Only | CacheSetting::ReloadAll
+    ) {
+      return false;
     }
-  }
-
-  pub async fn maybe_package_info(
-    &self,
-    name: &str,
-  ) -> Result<Option<NpmPackageInfo>, AnyError> {
-    let maybe_info = self.mem_cache.lock().get(name).cloned();
-    if let Some(info) = maybe_info {
-      Ok(info)
+    if self.inner().force_reload_flag.raise() {
+      self.clear_memory_cache(); // clear the memory cache to force reloading
+      true
     } else {
-      let mut maybe_package_info = None;
-      if !self.reload {
-        // attempt to load from the file cache
-        maybe_package_info = self.load_file_cached_package_info(name);
-      }
-
-      if maybe_package_info.is_none() {
-        maybe_package_info = self
-          .load_package_info_from_registry(name)
-          .await
-          .with_context(|| {
-          format!("Error getting response at {}", self.get_package_url(name))
-        })?;
-      }
-
-      // Not worth the complexity to ensure multiple in-flight requests
-      // for the same package only request once because with how this is
-      // used that should never happen.
-      let mut mem_cache = self.mem_cache.lock();
-      Ok(match mem_cache.get(name) {
-        // another thread raced here, so use its result instead
-        Some(info) => info.clone(),
-        None => {
-          mem_cache.insert(name.to_string(), maybe_package_info.clone());
-          maybe_package_info
-        }
-      })
+      false
     }
+  }
+
+  fn inner(&self) -> &Arc<CliNpmRegistryApiInner> {
+    // this panicking indicates a bug in the code where this
+    // wasn't initialized
+    self.0.as_ref().unwrap()
+  }
+}
+
+static SYNC_DOWNLOAD_TASK_QUEUE: Lazy<TaskQueue> =
+  Lazy::new(TaskQueue::default);
+
+#[async_trait]
+impl NpmRegistryApi for CliNpmRegistryApi {
+  async fn package_info(
+    &self,
+    name: &str,
+  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+    let result = if should_sync_download() {
+      let inner = self.inner().clone();
+      SYNC_DOWNLOAD_TASK_QUEUE
+        .queue(async move { inner.maybe_package_info(name).await })
+        .await
+    } else {
+      self.inner().maybe_package_info(name).await
+    };
+    match result {
+      Ok(Some(info)) => Ok(info),
+      Ok(None) => Err(NpmRegistryPackageInfoLoadError::PackageNotExists {
+        package_name: name.to_string(),
+      }),
+      Err(err) => {
+        Err(NpmRegistryPackageInfoLoadError::LoadError(Arc::new(err)))
+      }
+    }
+  }
+}
+
+type CacheItemPendingResult =
+  Result<Option<Arc<NpmPackageInfo>>, Arc<AnyError>>;
+
+#[derive(Debug)]
+enum CacheItem {
+  Pending(Shared<BoxFuture<'static, CacheItemPendingResult>>),
+  Resolved(Option<Arc<NpmPackageInfo>>),
+}
+
+#[derive(Debug)]
+struct CliNpmRegistryApiInner {
+  base_url: Url,
+  cache: Arc<NpmCache>,
+  force_reload_flag: AtomicFlag,
+  mem_cache: Mutex<HashMap<String, CacheItem>>,
+  previously_reloaded_packages: Mutex<HashSet<String>>,
+  http_client: Arc<HttpClient>,
+  progress_bar: ProgressBar,
+}
+
+impl CliNpmRegistryApiInner {
+  pub async fn maybe_package_info(
+    self: &Arc<Self>,
+    name: &str,
+  ) -> Result<Option<Arc<NpmPackageInfo>>, AnyError> {
+    let (created, future) = {
+      let mut mem_cache = self.mem_cache.lock();
+      match mem_cache.get(name) {
+        Some(CacheItem::Resolved(maybe_info)) => {
+          return Ok(maybe_info.clone());
+        }
+        Some(CacheItem::Pending(future)) => (false, future.clone()),
+        None => {
+          if (self.cache.cache_setting().should_use_for_npm_package(name) && !self.force_reload())
+            // if this has been previously reloaded, then try loading from the
+            // file system cache
+            || !self.previously_reloaded_packages.lock().insert(name.to_string())
+          {
+            // attempt to load from the file cache
+            if let Some(info) = self.load_file_cached_package_info(name) {
+              let result = Some(Arc::new(info));
+              mem_cache
+                .insert(name.to_string(), CacheItem::Resolved(result.clone()));
+              return Ok(result);
+            }
+          }
+
+          let future = {
+            let api = self.clone();
+            let name = name.to_string();
+            async move {
+              api
+                .load_package_info_from_registry(&name)
+                .await
+                .map(|info| info.map(Arc::new))
+                .map_err(Arc::new)
+            }
+            .boxed()
+            .shared()
+          };
+          mem_cache
+            .insert(name.to_string(), CacheItem::Pending(future.clone()));
+          (true, future)
+        }
+      }
+    };
+
+    if created {
+      match future.await {
+        Ok(maybe_info) => {
+          // replace the cache item to say it's resolved now
+          self
+            .mem_cache
+            .lock()
+            .insert(name.to_string(), CacheItem::Resolved(maybe_info.clone()));
+          Ok(maybe_info)
+        }
+        Err(err) => {
+          // purge the item from the cache so it loads next time
+          self.mem_cache.lock().remove(name);
+          Err(anyhow!("{:#}", err))
+        }
+      }
+    } else {
+      Ok(future.await.map_err(|err| anyhow!("{:#}", err))?)
+    }
+  }
+
+  fn force_reload(&self) -> bool {
+    self.force_reload_flag.is_raised()
   }
 
   fn load_file_cached_package_info(
@@ -210,10 +256,7 @@ impl NpmRegistryApi {
       Ok(value) => value,
       Err(err) => {
         if cfg!(debug_assertions) {
-          panic!(
-            "error loading cached npm package info for {}: {:#}",
-            name, err
-          );
+          panic!("error loading cached npm package info for {name}: {err:#}");
         } else {
           None
         }
@@ -231,7 +274,20 @@ impl NpmRegistryApi {
       Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
       Err(err) => return Err(err.into()),
     };
-    Ok(serde_json::from_str(&file_text)?)
+    match serde_json::from_str(&file_text) {
+      Ok(package_info) => Ok(Some(package_info)),
+      Err(err) => {
+        // This scenario might mean we need to load more data from the
+        // npm registry than before. So, just debug log while in debug
+        // rather than panic.
+        log::debug!(
+          "error deserializing registry.json for '{}'. Reloading. {:?}",
+          name,
+          err
+        );
+        Ok(None)
+      }
+    }
   }
 
   fn save_package_info_to_file_cache(
@@ -243,10 +299,7 @@ impl NpmRegistryApi {
       self.save_package_info_to_file_cache_result(name, package_info)
     {
       if cfg!(debug_assertions) {
-        panic!(
-          "error saving cached npm package info for {}: {:#}",
-          name, err
-        );
+        panic!("error saving cached npm package info for {name}: {err:#}");
       }
     }
   }
@@ -258,8 +311,8 @@ impl NpmRegistryApi {
   ) -> Result<(), AnyError> {
     let file_cache_path = self.get_package_file_cache_path(name);
     let file_text = serde_json::to_string(&package_info)?;
-    std::fs::create_dir_all(&file_cache_path.parent().unwrap())?;
-    fs_util::atomic_write_file(&file_cache_path, file_text, CACHE_PERM)?;
+    std::fs::create_dir_all(file_cache_path.parent().unwrap())?;
+    atomic_write_file(&file_cache_path, file_text, CACHE_PERM)?;
     Ok(())
   }
 
@@ -267,56 +320,45 @@ impl NpmRegistryApi {
     &self,
     name: &str,
   ) -> Result<Option<NpmPackageInfo>, AnyError> {
-    if self.cache_setting == CacheSetting::Only {
+    self
+      .load_package_info_from_registry_inner(name)
+      .await
+      .with_context(|| {
+        format!(
+          "Error getting response at {} for package \"{}\"",
+          self.get_package_url(name),
+          name
+        )
+      })
+  }
+
+  async fn load_package_info_from_registry_inner(
+    &self,
+    name: &str,
+  ) -> Result<Option<NpmPackageInfo>, AnyError> {
+    if *self.cache.cache_setting() == CacheSetting::Only {
       return Err(custom_error(
         "NotCached",
         format!(
-          "An npm specifier not found in cache: \"{}\", --cached-only is specified.",
-          name
+          "An npm specifier not found in cache: \"{name}\", --cached-only is specified."
         )
-      )
-      );
+      ));
     }
 
     let package_url = self.get_package_url(name);
+    let guard = self.progress_bar.update(package_url.as_str());
 
-    log::log!(
-      log::Level::Info,
-      "{} {}",
-      colors::green("Download"),
-      package_url,
-    );
-
-    let response = match reqwest::get(package_url).await {
-      Ok(response) => response,
-      Err(err) => {
-        // attempt to use the local cache
-        if let Some(info) = self.load_file_cached_package_info(name) {
-          return Ok(Some(info));
-        } else {
-          return Err(err.into());
-        }
+    let maybe_bytes = self
+      .http_client
+      .download_with_progress(package_url, &guard)
+      .await?;
+    match maybe_bytes {
+      Some(bytes) => {
+        let package_info = serde_json::from_slice(&bytes)?;
+        self.save_package_info_to_file_cache(name, &package_info);
+        Ok(Some(package_info))
       }
-    };
-
-    if response.status() == 404 {
-      Ok(None)
-    } else if !response.status().is_success() {
-      let status = response.status();
-      let maybe_response_text = response.text().await.ok();
-      bail!(
-        "Bad response: {:?}{}",
-        status,
-        match maybe_response_text {
-          Some(text) => format!("\n\n{}", text),
-          None => String::new(),
-        }
-      );
-    } else {
-      let bytes = response.bytes().await?;
-      let package_info = serde_json::from_slice(&bytes)?;
-      self.save_package_info_to_file_cache(name, &package_info);
-      Ok(Some(package_info))
+      None => Ok(None),
     }
   }
 
@@ -327,5 +369,21 @@ impl NpmRegistryApi {
   fn get_package_file_cache_path(&self, name: &str) -> PathBuf {
     let name_folder_path = self.cache.package_name_folder(name, &self.base_url);
     name_folder_path.join("registry.json")
+  }
+
+  pub fn clear_memory_cache(&self) {
+    self.mem_cache.lock().clear();
+  }
+
+  pub fn get_cached_package_info(
+    &self,
+    name: &str,
+  ) -> Option<Arc<NpmPackageInfo>> {
+    let mem_cache = self.mem_cache.lock();
+    if let Some(CacheItem::Resolved(maybe_info)) = mem_cache.get(name) {
+      maybe_info.clone()
+    } else {
+      None
+    }
   }
 }

@@ -1,3 +1,5 @@
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+
 use std::collections::HashMap;
 use std::fs;
 
@@ -71,6 +73,7 @@ fn get_npm_package(package_name: &str) -> Result<Option<CustomNpmPackage>> {
   // read all the package's versions
   let mut tarballs = HashMap::new();
   let mut versions = serde_json::Map::new();
+  let mut latest_version = semver::Version::parse("0.0.0").unwrap();
   for entry in fs::read_dir(&package_folder)? {
     let entry = entry?;
     let file_type = entry.file_type()?;
@@ -110,14 +113,13 @@ fn get_npm_package(package_name: &str) -> Result<Option<CustomNpmPackage>> {
     let mut dist = serde_json::Map::new();
     dist.insert(
       "integrity".to_string(),
-      format!("sha512-{}", tarball_checksum).into(),
+      format!("sha512-{tarball_checksum}").into(),
     );
     dist.insert("shasum".to_string(), "dummy-value".into());
     dist.insert(
       "tarball".to_string(),
       format!(
-        "http://localhost:4545/npm/registry/{}/{}.tgz",
-        package_name, version
+        "http://localhost:4545/npm/registry/{package_name}/{version}.tgz"
       )
       .into(),
     );
@@ -134,13 +136,21 @@ fn get_npm_package(package_name: &str) -> Result<Option<CustomNpmPackage>> {
     let mut version_info: serde_json::Map<String, serde_json::Value> =
       serde_json::from_str(&package_json_text)?;
     version_info.insert("dist".to_string(), dist.into());
-    versions.insert(version, version_info.into());
+    versions.insert(version.clone(), version_info.into());
+    let version = semver::Version::parse(&version)?;
+    if version.cmp(&latest_version).is_gt() {
+      latest_version = version;
+    }
   }
+
+  let mut dist_tags = serde_json::Map::new();
+  dist_tags.insert("latest".to_string(), latest_version.to_string().into());
 
   // create the registry file for this package
   let mut registry_file = serde_json::Map::new();
   registry_file.insert("name".to_string(), package_name.to_string().into());
   registry_file.insert("versions".to_string(), versions.into());
+  registry_file.insert("dist-tags".to_string(), dist_tags.into());
   Ok(Some(CustomNpmPackage {
     registry_file: serde_json::to_string(&registry_file).unwrap(),
     tarballs,

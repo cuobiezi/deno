@@ -1,4 +1,4 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 use std::collections::HashMap;
 
@@ -53,7 +53,10 @@ pub struct ReplLanguageServer {
 
 impl ReplLanguageServer {
   pub async fn new_initialized() -> Result<ReplLanguageServer, AnyError> {
+    // downgrade info and warn lsp logging to debug
     super::logging::set_lsp_log_level(log::Level::Debug);
+    super::logging::set_lsp_warn_level(log::Level::Debug);
+
     let language_server =
       super::language_server::LanguageServer::new(Client::new_for_repl());
 
@@ -74,6 +77,7 @@ impl ReplLanguageServer {
           window: None,
           general: None,
           experimental: None,
+          offset_encoding: None,
         },
         trace: None,
         workspace_folders: None,
@@ -187,7 +191,7 @@ impl ReplLanguageServer {
     let new_text = if new_text.ends_with('\n') {
       new_text.to_string()
     } else {
-      format!("{}\n", new_text)
+      format!("{new_text}\n")
     };
     self.document_version += 1;
     let current_line_count =
@@ -287,6 +291,7 @@ pub fn get_repl_workspace_settings() -> WorkspaceSettings {
     cache: None,
     import_map: None,
     code_lens: Default::default(),
+    inlay_hints: Default::default(),
     internal_debug: false,
     lint: false,
     tls_certificate: None,
